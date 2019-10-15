@@ -23,6 +23,7 @@ type Exporter struct {
   duration, error prometheus.Gauge
   totalScrapes    prometheus.Counter
   scrapeErrors    *prometheus.CounterVec
+  blockers        *prometheus.GaugeVec  
   session         *prometheus.GaugeVec
   sysstat         *prometheus.GaugeVec
   waitclass       *prometheus.GaugeVec
@@ -106,6 +107,11 @@ func NewExporter() *Exporter {
       Name:      "last_scrape_error",
       Help:      "Whether the last scrape of metrics from Oracle DB resulted in an error (1 for error, 0 for success).",
     }),
+    sysmetric: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+      Namespace: namespace,
+      Name:      "blockers",
+      Help:      "Gauge metric with blocking sessions.",
+    }, []string{"database","dbinstance","type"}),      
     sysmetric: prometheus.NewGaugeVec(prometheus.GaugeOpts{
       Namespace: namespace,
       Name:      "sysmetric",
@@ -270,6 +276,31 @@ func (e *Exporter) ScrapeParameter() {
   }
 }
 
+// Blockers collects metrics from the blockers view.
+func (e *Exporter) ScrapeBlockers() {
+  var (
+    rows *sql.Rows
+    err  error
+  )
+  for _, conn := range config.Cfgs {
+    if conn.db != nil {
+      rows, err = conn.db.Query(`SELECT iw.instance_name || ' - ' || lw.sid || ' / ' || sw.serial# waiting_instance_sid_serial, aw.sql_text waiting_sql_text FROM gv$lock lw, gv$lock lh, gv$instance iw, gv$instance ih, gv$session sw, gv$session sh, gv$sqlarea aw WHERE iw.inst_id = lw.inst_id AND ih.inst_id = lh.inst_id AND sw.inst_id = lw.inst_id AND sh.inst_id = lh.inst_id AND aw.inst_id = lw.inst_id AND sw.sid = lw.sid AND sh.sid = lh.sid AND lh.id1 = lw.id1 AND lh.id2 = lw.id2 AND lh.request = 0 AND lw.lmode = 0 AND (lh.id1, lh.id2) IN ( SELECT id1,id2 FROM gv$lock WHERE request = 0 INTERSECT SELECT id1,id2 FROM gv$lock WHERE lmode = 0 ) AND sw.sql_address = aw.address ORDER BY iw.instance_name, lw.sid`)
+      if err != nil {
+        continue
+      }
+      defer rows.Close()
+      for rows.Next() {
+        var name string
+        if err := rows.Scan(&name); err != nil {
+          break
+        }
+        name = cleanName(name)
+        e.blockers.WithLabelValues(conn.Database,conn.Instance,name).Set(value)
+      }
+    }
+  }
+}
+
 
 // ScrapeServices collects metrics from the v$active_services view.
 func (e *Exporter) ScrapeServices() {
@@ -311,8 +342,7 @@ func (e *Exporter) ScrapeCache() {
     //2110    Row Cache Hit Ratio
     if conn.db != nil {
       rows, err = conn.db.Query(`select metric_name,value
-                                 from v$sysmetric
-                                 where group_id=2 and metric_id in (2000,2050,2112,2110)`)
+                                 from v$sysmetric where metric_name like '%Hit Ratio' `)
       if err != nil {
         continue
       }
@@ -742,6 +772,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
   e.duration.Describe(ch)
   e.totalScrapes.Describe(ch)
   e.scrapeErrors.Describe(ch)
+  e.blockers.Describe(ch)    
   e.session.Describe(ch)
   e.sysstat.Describe(ch)
   e.waitclass.Describe(ch)
@@ -799,6 +830,7 @@ func (e *Exporter) Connect() {
       e.up.WithLabelValues(conf.Database,conf.Instance).Set(0)
     }
   }
+  e.blockers.Reset()
   e.session.Reset()
   e.sysstat.Reset()
   e.waitclass.Reset()
@@ -852,6 +884,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
   e.ScrapeUptime()
   e.uptime.Collect(ch)
 
+  e.ScrapeBlockers()
+  e.blockers.Collect(ch)
+    
   e.ScrapeSession()
   e.session.Collect(ch)
 
