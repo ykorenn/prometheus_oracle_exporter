@@ -107,7 +107,7 @@ func NewExporter() *Exporter {
       Name:      "last_scrape_error",
       Help:      "Whether the last scrape of metrics from Oracle DB resulted in an error (1 for error, 0 for success).",
     }),
-    sysmetric: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+    blockers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
       Namespace: namespace,
       Name:      "blockers",
       Help:      "Gauge metric with blocking sessions.",
@@ -291,11 +291,12 @@ func (e *Exporter) ScrapeBlockers() {
       defer rows.Close()
       for rows.Next() {
         var name string
-        if err := rows.Scan(&name); err != nil {
+        var value string
+        if err := rows.Scan(&name, &value); err != nil {
           break
         }
         name = cleanName(name)
-        e.blockers.WithLabelValues(conn.Database,conn.Instance,name).Set(value)
+        e.cache.WithLabelValues(conn.Database,conn.Instance,name).Set(value)
       }
     }
   }
