@@ -23,8 +23,8 @@ type Exporter struct {
   duration, error prometheus.Gauge
   totalScrapes    prometheus.Counter
   scrapeErrors    *prometheus.CounterVec
-  blockers        *prometheus.GaugeVec  
   session         *prometheus.GaugeVec
+  blockers        *prometheus.GaugeVec    
   sysstat         *prometheus.GaugeVec
   waitclass       *prometheus.GaugeVec
   sysmetric       *prometheus.GaugeVec
@@ -107,11 +107,6 @@ func NewExporter() *Exporter {
       Name:      "last_scrape_error",
       Help:      "Whether the last scrape of metrics from Oracle DB resulted in an error (1 for error, 0 for success).",
     }),
-    blockers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-      Namespace: namespace,
-      Name:      "blockers",
-      Help:      "Gauge metric with blocking sessions.",
-    }, []string{"database","dbinstance","type"}),      
     sysmetric: prometheus.NewGaugeVec(prometheus.GaugeOpts{
       Namespace: namespace,
       Name:      "sysmetric",
@@ -131,7 +126,12 @@ func NewExporter() *Exporter {
       Namespace: namespace,
       Name:      "session",
       Help:      "Gauge metric user/system active/passive sessions (v$session).",
-    }, []string{"database","dbinstance","type","state"}),
+    }, []string{"database","dbinstance","user","status"}),
+    blockers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+      Namespace: namespace,
+      Name:      "blockers",
+      Help:      "Gauge metric with user/system blockers (dba_blockers) .",
+    }, []string{"database","dbinstance","status","sqlid"}),      
     uptime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
       Namespace: namespace,
       Name:      "uptime",
@@ -258,7 +258,7 @@ func (e *Exporter) ScrapeParameter() {
     //num  metric_name
     //43  sessions
     if conn.db != nil {
-      rows, err = conn.db.Query(`select name,value from v$parameter WHERE num=43`)
+      rows, err = conn.db.Query(`select name,value from v$parameter WHERE name='sessions'`)
       if err != nil {
         continue
       }
@@ -275,33 +275,6 @@ func (e *Exporter) ScrapeParameter() {
     }
   }
 }
-
-// Blockers collects metrics from the blockers view.
-func (e *Exporter) ScrapeBlockers() {
-  var (
-    rows *sql.Rows
-    err  error
-  )
-  for _, conn := range config.Cfgs {
-    if conn.db != nil {
-      rows, err = conn.db.Query(`SELECT iw.instance_name || ' - ' || lw.sid || ' / ' || sw.serial# waiting_instance_sid_serial, aw.sql_text waiting_sql_text FROM gv$lock lw, gv$lock lh, gv$instance iw, gv$instance ih, gv$session sw, gv$session sh, gv$sqlarea aw WHERE iw.inst_id = lw.inst_id AND ih.inst_id = lh.inst_id AND sw.inst_id = lw.inst_id AND sh.inst_id = lh.inst_id AND aw.inst_id = lw.inst_id AND sw.sid = lw.sid AND sh.sid = lh.sid AND lh.id1 = lw.id1 AND lh.id2 = lw.id2 AND lh.request = 0 AND lw.lmode = 0 AND (lh.id1, lh.id2) IN ( SELECT id1,id2 FROM gv$lock WHERE request = 0 INTERSECT SELECT id1,id2 FROM gv$lock WHERE lmode = 0 ) AND sw.sql_address = aw.address ORDER BY iw.instance_name, lw.sid`)
-      if err != nil {
-        continue
-      }
-      defer rows.Close()
-      for rows.Next() {
-        var name string
-        var value string
-        if err := rows.Scan(&name, &value); err != nil {
-          break
-        }
-        name = cleanName(name)
-        e.cache.WithLabelValues(conn.Database,conn.Instance,name).Set(value)
-      }
-    }
-  }
-}
-
 
 // ScrapeServices collects metrics from the v$active_services view.
 func (e *Exporter) ScrapeServices() {
@@ -362,7 +335,7 @@ func (e *Exporter) ScrapeCache() {
 }
 
 
-// ScrapeRecovery collects tablespace metrics
+//  collects Redo metrics
 func (e *Exporter) ScrapeRedo() {
   var (
     rows *sql.Rows
@@ -370,7 +343,7 @@ func (e *Exporter) ScrapeRedo() {
   )
   for _, conn := range config.Cfgs {
     if conn.db != nil {
-      rows, err = conn.db.Query(`select count(*) from v$log_history where first_time > sysdate - 1/24/12`)
+      rows, err = conn.db.Query(`select round(((a.first_time-b.first_time)*25)*60,2) value from v$log_history a, v$log_history b where a.recid = b.recid + 1 and a.first_time > SYSDATE-1 order by a.first_time asc`)
       if err != nil {
         continue
       }
@@ -545,6 +518,36 @@ func (e *Exporter) ScrapeSession() {
   }
 }
 
+// Blockers collects metrics from the blockers view.
+//rows, err = conn.db.Query(`select 'blocker' as status, s.sql_id, w.HOLDING_SESSION sid from v$session s, dba_waiters w where w.HOLDING_SESSION=s.sid union select 'waiter' as status, s.sql_id, w.WAITING_SESSION from v$session s, dba_waiters w where w.WAITING_SESSION=s.sid `)
+
+func (e *Exporter) ScrapeBlockers() {
+  var (
+    rows *sql.Rows
+    err  error
+  )
+  for _, conn := range config.Cfgs {
+    if conn.db != nil {
+      rows, err = conn.db.Query(`select 'blocker' as status, s.sql_id as sqlid, w.HOLDING_SESSION sid from v$session s, dba_waiters w where w.HOLDING_SESSION=s.sid 
+                                 union
+                                 select 'waiter' as status, s.sql_id as sqlid, w.WAITING_SESSION sid from v$session s, dba_waiters w where w.WAITING_SESSION=s.sid`)
+      if err != nil {
+        continue
+      }
+      defer rows.Close()
+      for rows.Next() {
+        var status string
+        var sqlid string
+        var sid float64
+        if err := rows.Scan(&status, &sqlid, &sid); err != nil {
+          break
+        }
+        e.blockers.WithLabelValues(conn.Database,conn.Instance,"blocker", status,sqlid).Set(sid)
+        e.blockers.WithLabelValues(conn.Database,conn.Instance,"waiter",  status,sqlid).Set(sid)
+      }
+    }
+  }
+}
 
 // ScrapeUptime Instance uptime
 func (e *Exporter) ScrapeUptime() {
@@ -569,7 +572,7 @@ func (e *Exporter) ScrapeSysstat() {
   for _, conn := range config.Cfgs {
     if conn.db != nil {
       rows, err = conn.db.Query(`SELECT name, value FROM v$sysstat
-                                    WHERE statistic# in (6,7,1084,1089)`)
+                                    WHERE name in ('execute_count','parse_count_total','user_commits','user_rollbacks')`)
       if err != nil {
         continue
       }
@@ -773,8 +776,8 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
   e.duration.Describe(ch)
   e.totalScrapes.Describe(ch)
   e.scrapeErrors.Describe(ch)
-  e.blockers.Describe(ch)    
   e.session.Describe(ch)
+  e.blockers.Describe(ch)    
   e.sysstat.Describe(ch)
   e.waitclass.Describe(ch)
   e.sysmetric.Describe(ch)
@@ -996,3 +999,4 @@ func main() {
     log.Fatal(http.ListenAndServe(*listenAddress, nil))
   }
 }
+
